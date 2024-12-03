@@ -102,14 +102,14 @@ if "deb-us.archive.ubuntu.com-xenial" not in repositories:
 
 import fileinput
 import glob
+import itertools
 import logging
 import os
 import re
 import subprocess
-from collections.abc import Mapping
 from enum import Enum
 from subprocess import PIPE, CalledProcessError, check_output
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ LIBAPI = 0
 
 # Increment this PATCH version before using `charmcraft publish-lib` or reset
 # to 0 if you are raising the major API version
-LIBPATCH = 14
+LIBPATCH = 15
 
 
 VALID_SOURCE_TYPES = ("deb", "deb-src")
@@ -806,12 +806,17 @@ def _add(
 
 
 def remove_package(
-    package_names: Union[str, List[str]]
+    package_names: Union[str, List[str]],
+    autoremove: bool = False,
 ) -> Union[DebianPackage, List[DebianPackage]]:
     """Remove package(s) from the system.
 
     Args:
         package_names: the name of a package
+        autoremove: run `apt autoremove` after uninstalling packages.
+            You probably want to do this if you're removing a metapackage,
+            otherwise the concrete packages will still be there.
+            False by default for backwards compatibility.
 
     Raises:
         PackageNotFoundError if the package is not found.
@@ -830,6 +835,9 @@ def remove_package(
         except PackageNotFoundError:
             logger.info("package '%s' was requested for removal, but it was not installed.", p)
 
+    if autoremove:
+        subprocess.run(['apt', 'autoremove'], check=True)
+
     # the list of packages will be empty when no package is removed
     logger.debug("packages: '%s'", packages)
     return packages[0] if len(packages) == 1 else packages
@@ -837,7 +845,17 @@ def remove_package(
 
 def update() -> None:
     """Update the apt cache via `apt-get update`."""
-    subprocess.run(["apt-get", "update", "--error-on=any"], capture_output=True, check=True)
+    cmd = ["apt-get", "update", "--error-on=any"]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except CalledProcessError as e:
+        logger.error(
+            "%s:\nstdout:\n%s\nstderr:\n%s",
+            " ".join(cmd),
+            e.stdout.decode(),
+            e.stderr.decode(),
+        )
+        raise
 
 
 def import_key(key: str) -> str:
@@ -913,6 +931,9 @@ class GPGKeyError(Error):
 class DebianRepository:
     """An abstraction to represent a repository."""
 
+    _deb822_stanza: Optional["_Deb822Stanza"] = None
+    """set by Deb822Stanza after creating a DebianRepository"""
+
     def __init__(
         self,
         enabled: bool,
@@ -922,7 +943,7 @@ class DebianRepository:
         groups: List[str],
         filename: Optional[str] = "",
         gpg_key_filename: Optional[str] = "",
-        options: Optional[dict] = None,
+        options: Optional[Dict[str, str]] = None,
     ):
         self._enabled = enabled
         self._repotype = repotype
@@ -970,14 +991,15 @@ class DebianRepository:
         Args:
             fname: a filename to write the repository information to.
         """
-        if not fname.endswith(".list"):
-            raise InvalidSourceError("apt source filenames should end in .list!")
-
+        if not fname.endswith(".list") or fname.endswith(".sources"):
+            raise InvalidSourceError("apt source filenames should end in .list or .sources!")
         self._filename = fname
 
     @property
     def gpg_key(self):
         """Returns the path to the GPG key for this repository."""
+        if not self._gpg_key_filename and self._deb822_stanza is not None:
+            self._gpg_key_filename = self._deb822_stanza.get_gpg_key_filename()
         return self._gpg_key_filename
 
     @property
@@ -986,20 +1008,21 @@ class DebianRepository:
         return self._options
 
     def make_options_string(self) -> str:
-        """Generate the complete options string for a a repository.
+        """Generate the complete one-line-style options string for a repository.
 
         Combining `gpg_key`, if set, and the rest of the options to find
         a complex repo string.
         """
         options = self._options if self._options else {}
-        if self._gpg_key_filename:
-            options["signed-by"] = self._gpg_key_filename
 
-        return (
-            "[{}] ".format(" ".join(["{}={}".format(k, v) for k, v in options.items()]))
-            if options
-            else ""
-        )
+        gpg_key_filename = self.gpg_key  # ensure getter logic is run
+        if gpg_key_filename:
+            options["signed-by"] = gpg_key_filename
+
+        if not options:
+            return ""
+
+        return "[{}] ".format(" ".join("{}={}".format(k, v) for k, v in options.items()))
 
     @staticmethod
     def prefix_from_uri(uri: str) -> str:
@@ -1012,7 +1035,7 @@ class DebianRepository:
 
     @staticmethod
     def from_repo_line(repo_line: str, write_file: Optional[bool] = True) -> "DebianRepository":
-        """Instantiate a new `DebianRepository` a `sources.list` entry line.
+        """Instantiate a new `DebianRepository` from a `sources.list` entry line.
 
         Args:
             repo_line: a string representing a repository entry
@@ -1036,23 +1059,37 @@ class DebianRepository:
             else ""
         )
 
+        repo_str = (
+            "{}".format("#" if not repo.enabled else "")
+            + "{} {}{} ".format(repo.repotype, options_str, repo.uri)
+            + "{} {}\n".format(repo.release, " ".join(repo.groups))
+        )
+
         if write_file:
+            logger.info(
+                "DebianRepository.from_repo_line('%s', write_file=True)\nWriting to '%s':\n%s",
+                repo_line,
+                fname,
+                repo_str,
+            )
             with open(fname, "wb") as f:
-                f.write(
-                    (
-                        "{}".format("#" if not repo.enabled else "")
-                        + "{} {}{} ".format(repo.repotype, options_str, repo.uri)
-                        + "{} {}\n".format(repo.release, " ".join(repo.groups))
-                    ).encode("utf-8")
-                )
+                f.write(repo_str.encode("utf-8"))
 
         return repo
 
     def disable(self) -> None:
-        """Remove this repository from consideration.
+        """Remove this repository by disabling it in the source file.
 
-        Disable it instead of removing from the repository file.
+        WARNING: This method does NOT alter the `self.enabled` flag.
+
+        WARNING: disable is currently not implemented for repositories defined
+        by a deb822 stanza. Raises a NotImplementedError in this case.
         """
+        if self._deb822_stanza is not None:
+            raise NotImplementedError(
+                "Disabling a repository defined by a deb822 format source is not implemented."
+                " Please raise an issue if you require this feature."
+            )
         searcher = "{} {}{} {}".format(
             self.repotype, self.make_options_string(), self.uri, self.release
         )
@@ -1181,7 +1218,7 @@ class DebianRepository:
             keyf.write(key_material)
 
 
-class RepositoryMapping(Mapping):
+class RepositoryMapping(Mapping[str, DebianRepository]):
     """An representation of known repositories.
 
     Instantiation of `RepositoryMapping` will iterate through the
@@ -1197,29 +1234,52 @@ class RepositoryMapping(Mapping):
         ))
     """
 
+    _apt_dir = "/etc/apt"
+    _sources_subdir = "sources.list.d"
+    _default_list_name = "sources.list"
+    _default_sources_name = "ubuntu.sources"
+
     def __init__(self):
-        self._repository_map = {}
-        # Repositories that we're adding -- used to implement mode param
-        self.default_file = "/etc/apt/sources.list"
+        self._repository_map: Dict[str, DebianRepository] = {}
+        self.default_file = os.path.join(self._apt_dir, self._default_list_name)
+        # ^ public attribute for backwards compatibility only
+        sources_dir = os.path.join(self._apt_dir, self._sources_subdir)
+        default_sources = os.path.join(sources_dir, self._default_sources_name)
 
         # read sources.list if it exists
+        # ignore InvalidSourceError if ubuntu.sources also exists
+        # -- in this case, sources.list just contains a comment
         if os.path.isfile(self.default_file):
-            self.load(self.default_file)
+            try:
+                self.load(self.default_file)
+            except InvalidSourceError:
+                if not os.path.isfile(default_sources):
+                    raise
 
         # read sources.list.d
-        for file in glob.iglob("/etc/apt/sources.list.d/*.list"):
+        for file in glob.iglob(os.path.join(sources_dir, "*.list")):
             self.load(file)
+        for file in glob.iglob(os.path.join(sources_dir, "*.sources")):
+            self.load_deb822(file)
 
-    def __contains__(self, key: str) -> bool:
-        """Magic method for checking presence of repo in mapping."""
+    def __contains__(self, key: Any) -> bool:
+        """Magic method for checking presence of repo in mapping.
+
+        Checks against the string names used to identify repositories.
+        """
         return key in self._repository_map
 
     def __len__(self) -> int:
         """Return number of repositories in map."""
         return len(self._repository_map)
 
-    def __iter__(self) -> Iterable[DebianRepository]:
-        """Return iterator for RepositoryMapping."""
+    def __iter__(self) -> Iterator[DebianRepository]:
+        """Return iterator for RepositoryMapping.
+
+        Iterates over the DebianRepository values rather than the string names.
+        FIXME: this breaks the expectations of the Mapping abstract base class
+            for example when it provides methods like keys and items
+        """
         return iter(self._repository_map.values())
 
     def __getitem__(self, repository_uri: str) -> DebianRepository:
@@ -1230,16 +1290,72 @@ class RepositoryMapping(Mapping):
         """Add a `DebianRepository` to the cache."""
         self._repository_map[repository_uri] = repository
 
+    def load_deb822(self, filename: str) -> None:
+        """Load a deb822 format repository source file into the cache.
+
+        In contrast to one-line-style, the deb822 format specifies a repository
+        using a multi-line paragraph. Paragraphs are separated by whitespace,
+        and each definition consists of lines that are either key: value pairs,
+        or continuations of the previous value.
+
+        Read more about the deb822 format here:
+            https://manpages.ubuntu.com/manpages/noble/en/man5/sources.list.5.html
+        For instance, ubuntu 24.04 (noble) lists its sources using deb822 style in:
+            /etc/apt/sources.list.d/ubuntu.sources
+        """
+        with open(filename, "r") as f:
+            repos, errors = self._parse_deb822_lines(f, filename=filename)
+
+        for repo in repos:
+            repo_identifier = "{}-{}-{}".format(repo.repotype, repo.uri, repo.release)
+            self._repository_map[repo_identifier] = repo
+
+        if errors:
+            logger.debug(
+                "the following %d error(s) were encountered when reading deb822 sources:\n%s",
+                len(errors),
+                "\n".join(str(e) for e in errors),
+            )
+
+        if repos:
+            logger.info("parsed %d apt package repositories from %s", len(repos), filename)
+        else:
+            raise InvalidSourceError("all repository lines in '{}' were invalid!".format(filename))
+
+    @classmethod
+    def _parse_deb822_lines(
+        cls,
+        lines: Iterable[str],
+        filename: str = "",
+    ) -> Tuple[List[DebianRepository], List[InvalidSourceError]]:
+        """Parse lines from a deb822 file into a list of repos and a list of errors.
+
+        The semantics of `_parse_deb822_lines` slightly different to `_parse`:
+            `_parse` reads a commented out line as an entry that is not enabled
+            `_parse_deb822_lines` strips out comments entirely when parsing a file into stanzas,
+                instead only reading the 'Enabled' key to determine if an entry is enabled
+        """
+        repositories: List[DebianRepository] = []
+        errors: List[InvalidSourceError] = []
+        for numbered_lines in _iter_deb822_stanzas(lines):
+            try:
+                stanza = _Deb822Stanza(numbered_lines=numbered_lines, filename=filename)
+            except InvalidSourceError as e:
+                errors.append(e)
+            else:
+                repositories.extend(stanza.repositories)
+        return repositories, errors
+
     def load(self, filename: str):
-        """Load a repository source file into the cache.
+        """Load a one-line-style format repository source file into the cache.
 
         Args:
           filename: the path to the repository file
         """
-        parsed = []
-        skipped = []
+        parsed: List[int] = []
+        skipped: List[int] = []
         with open(filename, "r") as f:
-            for n, line in enumerate(f):
+            for n, line in enumerate(f, start=1):  # 1 indexed line numbers
                 try:
                     repo = self._parse(line, filename)
                 except InvalidSourceError:
@@ -1255,7 +1371,7 @@ class RepositoryMapping(Mapping):
             logger.debug("skipped the following lines in file '%s': %s", filename, skip_list)
 
         if parsed:
-            logger.info("parsed %d apt package repositories", len(parsed))
+            logger.info("parsed %d apt package repositories from %s", len(parsed), filename)
         else:
             raise InvalidSourceError("all repository lines in '{}' were invalid!".format(filename))
 
@@ -1314,48 +1430,308 @@ class RepositoryMapping(Mapping):
         else:
             raise InvalidSourceError("An invalid sources line was found in %s!", filename)
 
-    def add(self, repo: DebianRepository, default_filename: Optional[bool] = False) -> None:
-        """Add a new repository to the system.
+    def add(  # noqa: D417  # undocumented-param: default_filename intentionally undocumented
+        self,
+        repo: DebianRepository,
+        default_filename: Optional[bool] = False,
+        update_cache: bool = False,
+    ) -> "RepositoryMapping":
+        """Add a new repository to the system using add-apt-repository.
 
         Args:
-          repo: a `DebianRepository` object
-          default_filename: an (Optional) filename if the default is not desirable
+            repo: a DebianRepository object where repo.enabled is True
+            update_cache: if True, apt-add-repository will update the package cache
+                and then a new RepositoryMapping object will be returned.
+                If False, then apt-add-repository is run with the --no-update option,
+                and an entry for repo is added to this RepositoryMapping, and you
+                can call `update` manually before installing any packages.
+
+        Returns:
+            self, or a new RepositoryMapping object if update_cache is True
+
+        raises:
+            ValueError: if repo.enabled is False
+            CalledProcessError: if there's an error running apt-add-repository
+
+        WARNING: Does not associate the repository with a signing key.
+        Use the `import_key` method to add a signing key globally.
+
+        WARNING: the default_filename keyword argument is provided for backwards compatibility
+        only. It is not used, and was not used in the previous revision of this library.
         """
-        new_filename = "{}-{}.list".format(
-            DebianRepository.prefix_from_uri(repo.uri), repo.release.replace("/", "-")
-        )
-
-        fname = repo.filename or new_filename
-
-        options = repo.options if repo.options else {}
-        if repo.gpg_key:
-            options["signed-by"] = repo.gpg_key
-
-        with open(fname, "wb") as f:
-            f.write(
-                (
-                    "{}".format("#" if not repo.enabled else "")
-                    + "{} {}{} ".format(repo.repotype, repo.make_options_string(), repo.uri)
-                    + "{} {}\n".format(repo.release, " ".join(repo.groups))
-                ).encode("utf-8")
-            )
-
+        self._add_apt_repository(repo, update_cache=update_cache, remove=False)
+        if update_cache:
+            return RepositoryMapping()
         self._repository_map["{}-{}-{}".format(repo.repotype, repo.uri, repo.release)] = repo
+        return self
+
+    def _remove(self, repo: DebianRepository, update_cache: bool = False) -> "RepositoryMapping":
+        """Use add-apt-repository to remove a repository.
+
+        FIXME: doesn't seem to work
+
+        Args:
+            repo: a DebianRepository object where repo.enabled is True
+            update_cache: if True, apt-add-repository will update the package cache
+                and then a new RepositoryMapping object will be returned.
+                If False, then apt-add-repository is run with the --no-update option,
+                and any entry for the repo is removed from this RepositoryMapping, and you
+                can call `update` manually before installing any packages.
+
+        Returns:
+            self, or a new RepositoryMapping object if update_cache is True
+        """
+        self._add_apt_repository(repo, update_cache=update_cache, remove=True)
+        if update_cache:
+            return RepositoryMapping()
+        repo_id = "-".join((repo.repotype, repo.uri, repo.release))
+        self._repository_map.pop(repo_id, None)
+        return self
+
+    def _add_apt_repository(
+        self,
+        repo: DebianRepository,
+        update_cache: bool = False,
+        remove: bool = False,
+    ) -> None:
+        if not repo.enabled:
+            raise ValueError("{repo}.enabled is {value}".format(repo=repo, value=repo.enabled))
+        cmd = [
+            "apt-add-repository",
+            "--yes",
+            f"--uri={repo.uri}",
+        ]
+        # FIXME: trying to compute pocket seems like a dead end -- add by repo line format instead?
+        #_, _, pocket = repo.release.partition("-")
+        #if pocket:
+        #    cmd.append(f"--pocket={pocket}")
+        if repo.repotype == "deb-src":
+            cmd.append("--enable-source")
+        for component in repo.groups:
+            cmd.append(f"--component={component}")
+        if not update_cache:
+            cmd.append("--no-update")
+        if remove:
+            cmd.append("--remove")
+        logger.info(" ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except CalledProcessError as e:
+            logger.error(
+                "%s:\nstdout:\n%s\nstderr:\n%s",
+                " ".join(cmd),
+                e.stdout.decode(),
+                e.stderr.decode(),
+            )
+            raise
 
     def disable(self, repo: DebianRepository) -> None:
-        """Remove a repository. Disable by default.
+        """Remove a repository by disabling it in the source file.
 
-        Args:
-          repo: a `DebianRepository` to disable
+        WARNING: disable is currently not implemented for repositories defined
+        by a deb822 stanza, and will raise a NotImplementedError if called on one.
+
+        WARNING: This method does NOT alter the `.enabled` flag on the DebianRepository.
         """
-        searcher = "{} {}{} {}".format(
-            repo.repotype, repo.make_options_string(), repo.uri, repo.release
+        repo.disable()
+
+
+class _Deb822Stanza:
+    """Representation of a stanza from a deb822 source file.
+
+    May define multiple DebianRepository objects.
+    """
+
+    def __init__(self, numbered_lines: List[Tuple[int, str]], filename: str = ""):
+        self._filename = filename
+        self._numbered_lines = numbered_lines
+        if not numbered_lines:
+            self._repositories = ()
+            self._gpg_key_filename = ""
+            self._gpg_key_from_stanza = None
+            return
+        options, line_numbers = _deb822_stanza_to_options(numbered_lines)
+        repos, gpg_key_info = _deb822_options_to_repos(
+            options, line_numbers=line_numbers, filename=filename
         )
+        for repo in repos:
+            repo._deb822_stanza = self  # pyright: ignore[reportPrivateUsage]
+        self._repositories = repos
+        self._gpg_key_filename, self._gpg_key_from_stanza = gpg_key_info
 
-        for line in fileinput.input(repo.filename, inplace=True):
-            if re.match(r"^{}\s".format(re.escape(searcher)), line):
-                print("# {}".format(line), end="")
-            else:
-                print(line, end="")
+    @property
+    def repositories(self) -> Tuple[DebianRepository, ...]:
+        """The repositories defined by this deb822 stanza."""
+        return self._repositories
 
-        self._repository_map["{}-{}-{}".format(repo.repotype, repo.uri, repo.release)] = repo
+    def get_gpg_key_filename(self) -> str:
+        """Return the path to the GPG key for this repository.
+
+        Import the key first, if the key itself was provided in the stanza.
+        """
+        if self._gpg_key_filename:
+            return self._gpg_key_filename
+        if self._gpg_key_from_stanza is None:
+            return ""
+        # a gpg key was provided in the stanza
+        # and we haven't already imported it
+        self._gpg_key_filename = import_key(self._gpg_key_from_stanza)
+        return self._gpg_key_filename
+
+
+def _iter_deb822_stanzas(lines: Iterable[str]) -> Iterator[List[Tuple[int, str]]]:
+    """Given lines from a deb822 format file, yield a stanza of lines.
+
+    Args:
+        lines: an iterable of lines from a deb822 sources file
+
+    Yields:
+        lists of numbered lines (a tuple of line number and line) that make up
+        a deb822 stanza, with comments stripped out (but accounted for in line numbering)
+    """
+    current_paragraph: List[Tuple[int, str]] = []
+    for n, line in enumerate(lines, start=1):  # 1 indexed line numbers
+        if not line.strip():  # blank lines separate paragraphs
+            if current_paragraph:
+                yield current_paragraph
+                current_paragraph = []
+            continue
+        content, _delim, _comment = line.partition("#")
+        if content.strip():  # skip (potentially indented) comment line
+            current_paragraph.append((n, content.rstrip()))  # preserve indent
+    if current_paragraph:
+        yield current_paragraph
+
+
+def _deb822_stanza_to_options(
+    lines: Iterable[Tuple[int, str]],
+) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """Turn numbered lines into a dict of options and a dict of line numbers.
+
+    Args:
+        lines: an iterable of numbered lines (a tuple of line number and line)
+
+    Returns:
+        a dictionary of option names to (potentially multiline) values, and
+        a dictionary of option names to starting line number
+    """
+    parts: Dict[str, List[str]] = {}
+    line_numbers: Dict[str, int] = {}
+    current = None
+    for n, line in lines:
+        assert "#" not in line  # comments should be stripped out
+        if line.startswith(" "):  # continuation of previous key's value
+            assert current is not None
+            parts[current].append(line.rstrip())  # preserve indent
+            continue
+        raw_key, _, raw_value = line.partition(":")
+        current = raw_key.strip()
+        parts[current] = [raw_value.strip()]
+        line_numbers[current] = n
+    options = {k: "\n".join(v) for k, v in parts.items()}
+    return options, line_numbers
+
+
+def _deb822_options_to_repos(
+    options: Dict[str, str], line_numbers: Mapping[str, int] = {}, filename: str = ""
+) -> Tuple[Tuple[DebianRepository, ...], Tuple[str, Optional[str]]]:
+    """Return a collections of DebianRepository objects defined by this deb822 stanza.
+
+    Args:
+        options: a dictionary of deb822 field names to string options
+        line_numbers: a dictionary of field names to line numbers (for error messages)
+        filename: the file the options were read from (for repository object and errors)
+
+    Returns:
+        a tuple of `DebianRepository`s, and
+        a tuple of the gpg key filename and optional in-stanza provided key itself
+
+    Raises:
+      InvalidSourceError if any options are malformed or required options are missing
+    """
+    # Enabled
+    enabled_field = options.pop("Enabled", "yes")
+    if enabled_field == "yes":
+        enabled = True
+    elif enabled_field == "no":
+        enabled = False
+    else:
+        raise InvalidSourceError(
+            (
+                "Bad value '{value}' for entry 'Enabled' (line {enabled_line})"
+                " in file {file}. If 'Enabled' is present it must be one of"
+                " yes or no (if absent it defaults to yes)."
+            ).format(
+                value=enabled_field,
+                enabled_line=line_numbers.get("Enabled"),
+                file=filename,
+            )
+        )
+    # Signed-By
+    gpg_key_file = options.pop("Signed-By", "")
+    gpg_key_from_stanza: Optional[str] = None
+    if "\n" in gpg_key_file:
+        # actually a literal multi-line gpg-key rather than a filename
+        gpg_key_from_stanza = gpg_key_file
+        gpg_key_file = ""
+    # Types
+    try:
+        repotypes = options.pop("Types").split()
+        uris = options.pop("URIs").split()
+        suites = options.pop("Suites").split()
+    except KeyError as e:
+        [key] = e.args
+        raise InvalidSourceError(
+            "Missing required entry '{key}' for entry starting on line {line} in {file}.".format(
+                key=key,
+                line=min(line_numbers.values()) if line_numbers else None,
+                file=filename,
+            )
+        )
+    # Components
+    components: List[str]
+    if len(suites) == 1 and suites[0].endswith("/"):
+        if "Components" in options:
+            raise InvalidSourceError(
+                (
+                    "Since 'Suites' (line {suites_line}) specifies"
+                    " a path relative to  'URIs' (line {uris_line}),"
+                    " 'Components' (line {components_line}) must be  ommitted"
+                    " (in file {file})."
+                ).format(
+                    suites_line=line_numbers.get("Suites"),
+                    uris_line=line_numbers.get("URIs"),
+                    components_line=line_numbers.get("Components"),
+                    file=filename,
+                )
+            )
+        components = []
+    else:
+        if "Components" not in options:
+            raise InvalidSourceError(
+                (
+                    "Since 'Suites' (line {suites_line}) does not specify"
+                    " a path relative to  'URIs' (line {uris_line}),"
+                    " 'Components' must be  present in this paragraph"
+                    " (in file {file})."
+                ).format(
+                    suites_line=line_numbers.get("Suites"),
+                    uris_line=line_numbers.get("URIs"),
+                    file=filename,
+                )
+            )
+        components = options.pop("Components").split()
+    repos = tuple(
+        DebianRepository(
+            enabled=enabled,
+            repotype=repotype,
+            uri=uri,
+            release=suite,
+            groups=components,
+            filename=filename,
+            gpg_key_filename=gpg_key_file,
+            options=options,
+        )
+        for repotype, uri, suite in itertools.product(repotypes, uris, suites)
+    )
+    return repos, (gpg_key_file, gpg_key_from_stanza)
